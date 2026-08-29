@@ -12,12 +12,13 @@ export const HandTracker = () => {
   const smoothBoxRef = useRef<Box | null>(null);
   const cursorRef = useRef<Pt | null>(null);
   const confidenceRef = useRef(0);
-  const prevGrayRef = useRef<Uint8Array | null>(null);
+  const prevGrayRef = useRef<Float32Array | null>(null);
+  const lastHoverRef = useRef<Element | null>(null);
 
-  const [rSlider, setRSlider] = useState(74);
-  const [gSlider, setGSlider] = useState(34);
-  const [bSlider, setBSlider] = useState(31);
-  const [motionSlider, setMotionSlider] = useState(12);
+  const [rSlider, setRSlider] = useState(95);
+  const [gSlider, setGSlider] = useState(40);
+  const [bSlider, setBSlider] = useState(20);
+  const [motionSlider, setMotionSlider] = useState(16);
   const [motionAmtSlider, setMotionAmtSlider] = useState(279);
   const [fingersSlider, setFingersSlider] = useState(2);
 
@@ -31,6 +32,7 @@ export const HandTracker = () => {
   const CONF_GAIN = 2;
   const CONF_DROP = 1;
   const CONF_SHOW = 3;
+  const BG_BLEND = 0.9;
 
   const videoFromWebcam = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -39,9 +41,6 @@ export const HandTracker = () => {
         width: 1280,
         height: 720,
         frameRate: { ideal: 60 },
-        // @ts-ignore - not all browsers type these
-        exposureMode: "manual",
-        whiteBalanceMode: "manual",
       },
       audio: false,
     });
@@ -85,6 +84,36 @@ export const HandTracker = () => {
     return out;
   };
 
+  const blurGray = (src: Float32Array, w: number, h: number, r: number): Float32Array => {
+    const tmp = new Float32Array(w * h);
+    const out = new Float32Array(w * h);
+    const win = r * 2 + 1;
+
+    for (let y = 0; y < h; y++) {
+      let sum = 0;
+      const row = y * w;
+      for (let x = -r; x <= r; x++) sum += src[row + Math.min(w - 1, Math.max(0, x))];
+      for (let x = 0; x < w; x++) {
+        tmp[row + x] = sum / win;
+        const add = row + Math.min(w - 1, x + r + 1);
+        const sub = row + Math.max(0, x - r);
+        sum += src[add] - src[sub];
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      let sum = 0;
+      for (let y = -r; y <= r; y++) sum += tmp[x + w * Math.min(h - 1, Math.max(0, y))];
+      for (let y = 0; y < h; y++) {
+        out[y * w + x] = sum / win;
+        const add = x + w * Math.min(h - 1, y + r + 1);
+        const sub = x + w * Math.max(0, y - r);
+        sum += tmp[add] - tmp[sub];
+      }
+    }
+    return out;
+  };
+
+
   const lerp = (a: number, b: number, t: number) => a * t + b * (1 - t);
 
   const draw = () => {
@@ -106,22 +135,35 @@ export const HandTracker = () => {
     const data = frame.data;
 
     if (!prevGrayRef.current || prevGrayRef.current.length !== w * h) {
-      prevGrayRef.current = new Uint8Array(w * h);
+      prevGrayRef.current = new Float32Array(w * h);
     }
     const prevGray = prevGrayRef.current;
+
+    const gray = new Float32Array(w * h);
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+      gray[p] = (data[i] + data[i + 1] + data[i + 2]) / 3;
+    }
+
+    const blurred = blurGray(gray, w, h, 2);
 
     const skinMask = new Uint8Array(w * h);
     const motionMask = new Uint8Array(w * h);
     for (let i = 0, p = 0; i < data.length; i += 4, p++) {
       const r = data[i], g = data[i + 1], b = data[i + 2];
-      const gray = (r + g + b) / 3;
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+
       const isSkin =
         r > rRef.current && g > gRef.current && b > bRef.current &&
-        r > g && r > b && r - Math.min(g, b) > 15;
-      const moved = Math.abs(gray - prevGray[p]) > mRef.current;
-      skinMask[p] = isSkin ? 1 : 0;              // SOLID shape
-      motionMask[p] = (isSkin && moved) ? 1 : 0; // gate only
-      prevGray[p] = gray;
+        r > g && g >= b &&
+        r - g > 15 && r - b > 25 &&
+        mx - mn > 20 && r < 250;
+
+      const bg = prevGray[p];
+      const moved = Math.abs(blurred[p] - bg) > mRef.current;
+      prevGray[p] = bg * BG_BLEND + blurred[p] * (1 - BG_BLEND);
+
+      skinMask[p] = isSkin ? 1 : 0;
+      motionMask[p] = (isSkin && moved) ? 1 : 0;
     }
 
     let cleanMask = erodeDilate(skinMask, w, h);
@@ -179,9 +221,9 @@ export const HandTracker = () => {
     const looksLikeHand = (b: Box & { area: number }) => {
       const boxW = b.maxX - b.minX + 1;
       const boxH = b.maxY - b.minY + 1;
-      const minRun = Math.max(3, Math.round(boxW * 0.02)); // a finger is at least this wide
-      const minGap = Math.max(6, Math.round(boxW * 0.04)); // a real gap between fingers
-      const fingerZone = b.minY + Math.floor(boxH * 0.6);  // fingers live in the upper part
+      const minRun = Math.max(3, Math.round(boxW * 0.02));
+      const minGap = Math.max(6, Math.round(boxW * 0.04));
+      const fingerZone = b.minY + Math.floor(boxH * 0.6);
       const tipRows = Math.max(6, Math.floor(boxH * 0.08));
 
       let maxFingers = 0, maxWidth = 0, tipSum = 0, tipN = 0;
@@ -203,18 +245,18 @@ export const HandTracker = () => {
         if (y <= fingerZone) {
           const kept: [number, number][] = [];
           for (const [rs, re] of runs) {
-            if (re - rs + 1 < minRun) continue;                       // ignore thin noise
+            if (re - rs + 1 < minRun) continue;
             if (kept.length && rs - kept[kept.length - 1][1] < minGap)
-              kept[kept.length - 1][1] = re;                          // merge across tiny gaps
+              kept[kept.length - 1][1] = re;
             else kept.push([rs, re]);
           }
           if (kept.length > maxFingers) maxFingers = kept.length;
         }
       }
 
-      const openHand = maxFingers >= fingersRef.current;           // spread hand
+      const openHand = maxFingers >= fingersRef.current;
       const tipWidth = tipN ? tipSum / tipN : maxWidth;
-      const pointingFinger = maxWidth > 0 && tipWidth <= 0.45 * maxWidth; // one finger up
+      const pointingFinger = maxWidth > 0 && tipWidth <= 0.45 * maxWidth;
       return openHand || pointingFinger;
     };
 
@@ -277,7 +319,6 @@ export const HandTracker = () => {
         hctx.putImageData(handImg, 0, 0);
       }
 
-      // fingertip = topmost point of the SOLID hand shape
       let found = false;
       for (let y = hand.minY; y <= hand.maxY && !found; y++) {
         for (let x = hand.minX; x <= hand.maxX; x++) {
@@ -318,6 +359,26 @@ export const HandTracker = () => {
     } else if (confidenceRef.current === 0) {
       smoothBoxRef.current = null;
       cursorRef.current = null;
+    }
+
+    if (tracking && cursorRef.current) {
+      const rect = canvas.getBoundingClientRect();
+      const pageX = rect.left + (cursorRef.current[0] / w) * rect.width;
+      const pageY = rect.top + (cursorRef.current[1] / h) * rect.height;
+
+      const el = document.elementFromPoint(pageX, pageY);
+      if (el && el !== lastHoverRef.current) {
+        lastHoverRef.current?.dispatchEvent(
+          new MouseEvent("mouseout", { clientX: pageX, clientY: pageY, bubbles: true })
+        );
+        el.dispatchEvent(
+          new MouseEvent("mouseover", { clientX: pageX, clientY: pageY, bubbles: true })
+        );
+        lastHoverRef.current = el;
+      }
+      el?.dispatchEvent(
+        new MouseEvent("mousemove", { clientX: pageX, clientY: pageY, bubbles: true })
+      );
     }
 
     if (tracking && smoothBoxRef.current && cursorRef.current) {
